@@ -91,17 +91,35 @@ def format_date(date_str):
 
 
 # --- DB helpers ---
-def get_shipments(status_filter="all"):
+def get_shipments(status_filter="all", search="", date_from=None, date_to=None):
     conn = get_db()
+    clauses = []
+    params = []
+
     if status_filter and status_filter != "all":
-        rows = conn.execute(
-            "SELECT * FROM shipments WHERE status = ? ORDER BY updated_at DESC",
-            (status_filter,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM shipments ORDER BY updated_at DESC"
-        ).fetchall()
+        clauses.append("status = ?")
+        params.append(status_filter)
+
+    if search:
+        clauses.append(
+            "(venue_id LIKE ? OR supplier_id LIKE ? OR serial_number LIKE ? "
+            "OR tracking_number LIKE ? OR contact_name LIKE ?)"
+        )
+        term = f"%{search}%"
+        params.extend([term] * 5)
+
+    if date_from:
+        clauses.append("DATE(created_at) >= ?")
+        params.append(date_from.strftime("%Y-%m-%d"))
+
+    if date_to:
+        clauses.append("DATE(created_at) <= ?")
+        params.append(date_to.strftime("%Y-%m-%d"))
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM shipments{where} ORDER BY updated_at DESC", params
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -222,19 +240,26 @@ with st.sidebar:
                 st.success(f"Shipment #{sid} created!")
                 st.rerun()
 
-# --- Filter ---
-col_filter, col_spacer = st.columns([2, 5])
-with col_filter:
-    filter_options = ["all"] + STATUS_KEYS
-    filter_labels = ["All"] + [STATUS_OPTIONS[k] for k in STATUS_KEYS]
+# --- Search & Filters ---
+search_col, status_col, date_from_col, date_to_col = st.columns([3, 2, 2, 2])
+with search_col:
+    search_query = st.text_input(
+        "Search",
+        placeholder="Venue ID, Supplier ID, Serial #, Tracking #, Contact...",
+    )
+with status_col:
     status_filter = st.selectbox(
-        "Filter by status",
-        options=filter_options,
+        "Status",
+        options=["all"] + STATUS_KEYS,
         format_func=lambda x: "All" if x == "all" else format_status(x),
     )
+with date_from_col:
+    date_from = st.date_input("Created from", value=None)
+with date_to_col:
+    date_to = st.date_input("Created to", value=None)
 
 # --- Shipments table ---
-shipments = get_shipments(status_filter)
+shipments = get_shipments(status_filter, search_query.strip(), date_from, date_to)
 
 if not shipments:
     st.info("No shipments found. Use the sidebar to create one.")
