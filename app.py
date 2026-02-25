@@ -1,6 +1,6 @@
 import streamlit as st
-import sqlite3
-import os
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 # --- Page config ---
@@ -10,58 +10,58 @@ st.set_page_config(
     layout="wide",
 )
 
-# --- Database setup ---
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "shipments.db")
+# --- Google Sheets setup ---
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+SHIPMENT_COLS = [
+    "id", "venue_id", "supplier_id", "address", "contact_name",
+    "serial_number", "tracking_number", "carrier", "status",
+    "notes", "created_by", "assigned_to", "created_at", "updated_at",
+]
+
+HISTORY_COLS = [
+    "id", "shipment_id", "old_status", "new_status",
+    "changed_by", "note", "created_at",
+]
 
 
-def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+@st.cache_resource
+def get_gsheet():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(st.secrets["spreadsheet_id"])
+    # Ensure worksheets exist with headers
+    _ensure_worksheet(sheet, "shipments", SHIPMENT_COLS)
+    _ensure_worksheet(sheet, "history", HISTORY_COLS)
+    return sheet
+
+
+def _ensure_worksheet(sheet, title, headers):
+    try:
+        ws = sheet.worksheet(title)
+        if not ws.row_values(1):
+            ws.append_row(headers, value_input_option="RAW")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=title, rows=1000, cols=len(headers))
+        ws.append_row(headers, value_input_option="RAW")
 
 
 def now():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def init_db():
-    conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS shipments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            venue_id TEXT NOT NULL,
-            supplier_id TEXT NOT NULL,
-            address TEXT NOT NULL,
-            contact_name TEXT DEFAULT '',
-            serial_number TEXT DEFAULT '',
-            tracking_number TEXT DEFAULT '',
-            carrier TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'pending',
-            notes TEXT DEFAULT '',
-            created_by TEXT DEFAULT 'Ale',
-            assigned_to TEXT DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
+def _next_id(ws):
+    """Get next auto-increment ID from a worksheet."""
+    records = ws.get_all_records()
+    if not records:
+        return 1
+    return max(int(r.get("id", 0)) for r in records) + 1
 
-        CREATE TABLE IF NOT EXISTS status_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shipment_id INTEGER NOT NULL,
-            old_status TEXT,
-            new_status TEXT NOT NULL,
-            changed_by TEXT DEFAULT '',
-            note TEXT DEFAULT '',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (shipment_id) REFERENCES shipments(id)
-        );
-    """)
-    conn.close()
-
-
-init_db()
 
 # --- Constants ---
 STATUS_OPTIONS = {
@@ -84,132 +84,153 @@ def format_date(date_str):
     if not date_str:
         return ""
     try:
-        dt = datetime.fromisoformat(date_str)
+        dt = datetime.fromisoformat(str(date_str))
         return dt.strftime("%d %b %Y %H:%M")
     except (ValueError, TypeError):
-        return date_str
+        return str(date_str)
 
 
-# --- DB helpers ---
+# --- DB helpers (Google Sheets) ---
 def get_shipments(status_filter="all", search="", date_from=None, date_to=None):
-    conn = get_db()
-    clauses = []
-    params = []
+    sheet = get_gsheet()
+    ws = sheet.worksheet("shipments")
+    records = ws.get_all_records()
 
-    if status_filter and status_filter != "all":
-        clauses.append("status = ?")
-        params.append(status_filter)
+    results = []
+    search_lower = search.lower() if search else ""
 
-    if search:
-        clauses.append(
-            "(venue_id LIKE ? OR supplier_id LIKE ? OR serial_number LIKE ? "
-            "OR tracking_number LIKE ? OR contact_name LIKE ?)"
-        )
-        term = f"%{search}%"
-        params.extend([term] * 5)
+    for r in records:
+        # Status filter
+        if status_filter and status_filter != "all" and r.get("status") != status_filter:
+            continue
 
-    if date_from:
-        clauses.append("DATE(created_at) >= ?")
-        params.append(date_from.strftime("%Y-%m-%d"))
+        # Text search across multiple fields
+        if search_lower:
+            searchable = " ".join(
+                str(r.get(f, "")).lower()
+                for f in ["venue_id", "supplier_id", "serial_number",
+                          "tracking_number", "contact_name"]
+            )
+            if search_lower not in searchable:
+                continue
 
-    if date_to:
-        clauses.append("DATE(created_at) <= ?")
-        params.append(date_to.strftime("%Y-%m-%d"))
+        # Date filters
+        created = str(r.get("created_at", ""))[:10]
+        if date_from and created < date_from.strftime("%Y-%m-%d"):
+            continue
+        if date_to and created > date_to.strftime("%Y-%m-%d"):
+            continue
 
-    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    rows = conn.execute(
-        f"SELECT * FROM shipments{where} ORDER BY updated_at DESC", params
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+        results.append(r)
 
-
-def get_shipment(shipment_id):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM shipments WHERE id = ?", (shipment_id,)
-    ).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    # Sort by updated_at descending
+    results.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
+    return results
 
 
 def get_history(shipment_id):
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM status_history WHERE shipment_id = ? ORDER BY created_at DESC",
-        (shipment_id,),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    sheet = get_gsheet()
+    ws = sheet.worksheet("history")
+    records = ws.get_all_records()
+    results = [r for r in records if str(r.get("shipment_id")) == str(shipment_id)]
+    results.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+    return results
 
 
 def create_shipment(venue_id, supplier_id, address, contact_name, notes, created_by):
-    conn = get_db()
+    sheet = get_gsheet()
+    ws_ship = sheet.worksheet("shipments")
+    ws_hist = sheet.worksheet("history")
+
     ts = now()
-    cur = conn.execute(
-        """INSERT INTO shipments (venue_id, supplier_id, address, contact_name, notes, created_by, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (venue_id, supplier_id, address, contact_name, notes, created_by, ts, ts),
+    ship_id = _next_id(ws_ship)
+
+    ws_ship.append_row(
+        [ship_id, venue_id, supplier_id, address, contact_name,
+         "", "", "", "pending", notes, created_by, "", ts, ts],
+        value_input_option="RAW",
     )
-    shipment_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO status_history (shipment_id, new_status, changed_by, note, created_at) VALUES (?, ?, ?, ?, ?)",
-        (shipment_id, "pending", created_by, "Shipment created", ts),
+
+    hist_id = _next_id(ws_hist)
+    ws_hist.append_row(
+        [hist_id, ship_id, "", "pending", created_by, "Shipment created", ts],
+        value_input_option="RAW",
     )
-    conn.commit()
-    conn.close()
-    return shipment_id
+
+    return ship_id
+
+
+def _find_row(ws, shipment_id):
+    """Find the row number (1-indexed) for a shipment by ID. Row 1 is headers."""
+    records = ws.get_all_records()
+    for i, r in enumerate(records):
+        if str(r.get("id")) == str(shipment_id):
+            return i + 2, r  # +2: 1 for 0-index, 1 for header row
+    return None, None
 
 
 def update_shipment(shipment_id, updates, changed_by="", status_note=""):
-    conn = get_db()
-    old = conn.execute(
-        "SELECT * FROM shipments WHERE id = ?", (shipment_id,)
-    ).fetchone()
+    sheet = get_gsheet()
+    ws = sheet.worksheet("shipments")
+
+    row_num, old = _find_row(ws, shipment_id)
     if not old:
-        conn.close()
         return False
 
-    old_status = old["status"]
+    old_status = old.get("status", "")
+    ts = now()
+
     allowed = [
         "venue_id", "supplier_id", "address", "contact_name",
         "serial_number", "tracking_number", "carrier",
         "status", "notes", "assigned_to",
     ]
-    sets = []
-    vals = []
+
+    # Build updated row
+    updated = dict(old)
     for field in allowed:
         if field in updates and updates[field] is not None:
-            sets.append(f"{field} = ?")
-            vals.append(updates[field])
+            updated[field] = updates[field]
+    updated["updated_at"] = ts
 
-    ts = now()
-    if sets:
-        sets.append("updated_at = ?")
-        vals.append(ts)
-        vals.append(shipment_id)
-        conn.execute(
-            f"UPDATE shipments SET {', '.join(sets)} WHERE id = ?", vals
-        )
+    # Write back the full row
+    row_values = [updated.get(col, "") for col in SHIPMENT_COLS]
+    ws.update(f"A{row_num}:{chr(64 + len(SHIPMENT_COLS))}{row_num}", [row_values],
+              value_input_option="RAW")
 
+    # Log status change
     new_status = updates.get("status")
     if new_status and new_status != old_status:
-        conn.execute(
-            "INSERT INTO status_history (shipment_id, old_status, new_status, changed_by, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (shipment_id, old_status, new_status, changed_by, status_note, ts),
+        ws_hist = sheet.worksheet("history")
+        hist_id = _next_id(ws_hist)
+        ws_hist.append_row(
+            [hist_id, shipment_id, old_status, new_status,
+             changed_by, status_note, ts],
+            value_input_option="RAW",
         )
 
-    conn.commit()
-    conn.close()
     return True
 
 
 def delete_shipment(shipment_id):
-    conn = get_db()
-    conn.execute("DELETE FROM status_history WHERE shipment_id = ?", (shipment_id,))
-    conn.execute("DELETE FROM shipments WHERE id = ?", (shipment_id,))
-    conn.commit()
-    conn.close()
+    sheet = get_gsheet()
+
+    # Delete from shipments
+    ws = sheet.worksheet("shipments")
+    row_num, _ = _find_row(ws, shipment_id)
+    if row_num:
+        ws.delete_rows(row_num)
+
+    # Delete related history rows (bottom-up to keep indices stable)
+    ws_hist = sheet.worksheet("history")
+    records = ws_hist.get_all_records()
+    rows_to_delete = []
+    for i, r in enumerate(records):
+        if str(r.get("shipment_id")) == str(shipment_id):
+            rows_to_delete.append(i + 2)  # +2 for 0-index + header
+
+    for row_num in sorted(rows_to_delete, reverse=True):
+        ws_hist.delete_rows(row_num)
 
 
 # --- UI ---
@@ -267,7 +288,7 @@ else:
     for s in shipments:
         with st.expander(
             f"**#{s['id']}** — Venue {s['venue_id']} | {format_status(s['status'])} | "
-            f"{'Serial: ' + s['serial_number'] if s['serial_number'] else 'No serial yet'} | "
+            f"{'Serial: ' + str(s['serial_number']) if s['serial_number'] else 'No serial yet'} | "
             f"Updated {format_date(s['updated_at'])}",
             expanded=False,
         ):
@@ -297,21 +318,22 @@ else:
             with st.form(f"edit_{s['id']}"):
                 e_col1, e_col2 = st.columns(2)
                 with e_col1:
-                    e_serial = st.text_input("Serial Number", value=s["serial_number"] or "", key=f"serial_{s['id']}")
-                    e_tracking = st.text_input("Tracking Number", value=s["tracking_number"] or "", key=f"tracking_{s['id']}")
-                    e_carrier = st.text_input("Carrier", value=s["carrier"] or "", key=f"carrier_{s['id']}", placeholder="DHL, UPS, GLS...")
+                    e_serial = st.text_input("Serial Number", value=str(s["serial_number"] or ""), key=f"serial_{s['id']}")
+                    e_tracking = st.text_input("Tracking Number", value=str(s["tracking_number"] or ""), key=f"tracking_{s['id']}")
+                    e_carrier = st.text_input("Carrier", value=str(s["carrier"] or ""), key=f"carrier_{s['id']}", placeholder="DHL, UPS, GLS...")
                 with e_col2:
+                    current_status = s["status"] if s["status"] in STATUS_KEYS else "pending"
                     e_status = st.selectbox(
                         "Status",
                         options=STATUS_KEYS,
-                        index=STATUS_KEYS.index(s["status"]),
+                        index=STATUS_KEYS.index(current_status),
                         format_func=format_status,
                         key=f"status_{s['id']}",
                     )
-                    e_assigned = st.text_input("Assigned To", value=s["assigned_to"] or "", key=f"assigned_{s['id']}")
+                    e_assigned = st.text_input("Assigned To", value=str(s["assigned_to"] or ""), key=f"assigned_{s['id']}")
                     e_changed_by = st.text_input("Updated By", key=f"changed_by_{s['id']}", placeholder="Your name")
 
-                e_notes = st.text_area("Notes", value=s["notes"] or "", key=f"notes_{s['id']}")
+                e_notes = st.text_area("Notes", value=str(s["notes"] or ""), key=f"notes_{s['id']}")
                 e_status_note = st.text_input("Status Update Note", key=f"status_note_{s['id']}", placeholder="Reason for status change")
 
                 btn_col1, btn_col2 = st.columns([1, 4])
