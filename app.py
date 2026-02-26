@@ -14,7 +14,7 @@ st.set_page_config(
 
 @st.cache_resource
 def get_supabase():
-    return create_client(st.secrets["supabase_url"], st.secrets["supabase_key"])
+    return create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 
 
 supabase = get_supabase()
