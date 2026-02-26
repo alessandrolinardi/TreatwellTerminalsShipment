@@ -53,7 +53,7 @@ def format_date(date_str):
 
 # --- DB helpers ---
 def get_shipments(status_filter="all", search="", date_from=None, date_to=None):
-    query = supabase.table("shipments").select("*")
+    query = supabase.table("terminal_shipments").select("*")
 
     if status_filter and status_filter != "all":
         query = query.eq("status", status_filter)
@@ -80,7 +80,7 @@ def get_shipments(status_filter="all", search="", date_from=None, date_to=None):
 
 def get_shipment(shipment_id):
     response = (
-        supabase.table("shipments")
+        supabase.table("terminal_shipments")
         .select("*")
         .eq("id", shipment_id)
         .maybe_single()
@@ -91,7 +91,7 @@ def get_shipment(shipment_id):
 
 def get_history(shipment_id):
     response = (
-        supabase.table("status_history")
+        supabase.table("terminal_shipments_status_history")
         .select("*")
         .eq("shipment_id", shipment_id)
         .order("created_at", desc=True)
@@ -103,7 +103,7 @@ def get_history(shipment_id):
 def create_shipment(venue_id, supplier_id, address, contact_name, notes, created_by):
     ts = now()
     response = (
-        supabase.table("shipments")
+        supabase.table("terminal_shipments")
         .insert(
             {
                 "venue_id": venue_id,
@@ -120,7 +120,7 @@ def create_shipment(venue_id, supplier_id, address, contact_name, notes, created
     )
     shipment_id = response.data[0]["id"]
 
-    supabase.table("status_history").insert(
+    supabase.table("terminal_shipments_status_history").insert(
         {
             "shipment_id": shipment_id,
             "new_status": "pending",
@@ -149,11 +149,11 @@ def update_shipment(shipment_id, updates, changed_by="", status_note=""):
     ts = now()
     if changes:
         changes["updated_at"] = ts
-        supabase.table("shipments").update(changes).eq("id", shipment_id).execute()
+        supabase.table("terminal_shipments").update(changes).eq("id", shipment_id).execute()
 
     new_status = updates.get("status")
     if new_status and new_status != old_status:
-        supabase.table("status_history").insert(
+        supabase.table("terminal_shipments_status_history").insert(
             {
                 "shipment_id": shipment_id,
                 "old_status": old_status,
@@ -168,8 +168,8 @@ def update_shipment(shipment_id, updates, changed_by="", status_note=""):
 
 
 def delete_shipment(shipment_id):
-    supabase.table("status_history").delete().eq("shipment_id", shipment_id).execute()
-    supabase.table("shipments").delete().eq("id", shipment_id).execute()
+    supabase.table("terminal_shipments_status_history").delete().eq("shipment_id", shipment_id).execute()
+    supabase.table("terminal_shipments").delete().eq("id", shipment_id).execute()
 
 
 # --- UI ---
