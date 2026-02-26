@@ -1,11 +1,11 @@
 -- 001_initial.sql
--- Creates shipments and status_history tables.
--- Matches the existing database pattern (SERIAL IDs, existing tables use integer PKs).
+-- Creates shipments and status_history tables for the Terminal Shipments app.
+-- These are standalone tables — other tables in this Supabase instance belong to other projects.
 -- Run: psql "$DATABASE_URL" -f supabase/migrations/001_initial.sql
 
 -- Shipments table
 CREATE TABLE IF NOT EXISTS shipments (
-    id SERIAL PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     venue_id TEXT NOT NULL,
     supplier_id TEXT NOT NULL,
     address TEXT NOT NULL,
@@ -19,17 +19,6 @@ CREATE TABLE IF NOT EXISTS shipments (
     assigned_to TEXT DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Status history table
-CREATE TABLE IF NOT EXISTS status_history (
-    id SERIAL PRIMARY KEY,
-    shipment_id INTEGER NOT NULL REFERENCES shipments(id) ON DELETE CASCADE,
-    old_status TEXT,
-    new_status TEXT NOT NULL,
-    changed_by TEXT DEFAULT '',
-    note TEXT DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Auto-update updated_at on every UPDATE
@@ -53,6 +42,17 @@ BEGIN
     END IF;
 END;
 $$;
+
+-- Status history table
+CREATE TABLE IF NOT EXISTS status_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    shipment_id UUID NOT NULL REFERENCES shipments(id) ON DELETE CASCADE,
+    old_status TEXT,
+    new_status TEXT NOT NULL,
+    changed_by TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- Row Level Security (service role key bypasses RLS)
 ALTER TABLE shipments ENABLE ROW LEVEL SECURITY;
