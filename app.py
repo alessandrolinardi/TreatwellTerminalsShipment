@@ -1,7 +1,6 @@
 import streamlit as st
-import psycopg2
-import psycopg2.extras
-from datetime import datetime
+from supabase import create_client
+from datetime import datetime, timezone
 
 # --- Page config ---
 st.set_page_config(
@@ -10,54 +9,20 @@ st.set_page_config(
     layout="wide",
 )
 
-# --- Database setup (Supabase PostgreSQL) ---
+# --- Supabase client ---
 
 
-def get_db():
-    return psycopg2.connect(st.secrets["database_url"])
+@st.cache_resource
+def get_supabase():
+    return create_client(st.secrets["supabase_url"], st.secrets["supabase_key"])
+
+
+supabase = get_supabase()
 
 
 def now():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).isoformat()
 
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS shipments (
-            id SERIAL PRIMARY KEY,
-            venue_id TEXT NOT NULL,
-            supplier_id TEXT NOT NULL,
-            address TEXT NOT NULL,
-            contact_name TEXT DEFAULT '',
-            serial_number TEXT DEFAULT '',
-            tracking_number TEXT DEFAULT '',
-            carrier TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'pending',
-            notes TEXT DEFAULT '',
-            created_by TEXT DEFAULT 'Ale',
-            assigned_to TEXT DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS status_history (
-            id SERIAL PRIMARY KEY,
-            shipment_id INTEGER NOT NULL REFERENCES shipments(id),
-            old_status TEXT,
-            new_status TEXT NOT NULL,
-            changed_by TEXT DEFAULT '',
-            note TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-init_db()
 
 # --- Constants ---
 STATUS_OPTIONS = {
@@ -88,92 +53,89 @@ def format_date(date_str):
 
 # --- DB helpers ---
 def get_shipments(status_filter="all", search="", date_from=None, date_to=None):
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    clauses = []
-    params = []
+    query = supabase.table("shipments").select("*")
 
     if status_filter and status_filter != "all":
-        clauses.append("status = %s")
-        params.append(status_filter)
+        query = query.eq("status", status_filter)
 
     if search:
-        clauses.append(
-            "(venue_id ILIKE %s OR supplier_id ILIKE %s OR serial_number ILIKE %s "
-            "OR tracking_number ILIKE %s OR contact_name ILIKE %s)"
-        )
         term = f"%{search}%"
-        params.extend([term] * 5)
+        query = query.or_(
+            f"venue_id.ilike.{term},"
+            f"supplier_id.ilike.{term},"
+            f"serial_number.ilike.{term},"
+            f"tracking_number.ilike.{term},"
+            f"contact_name.ilike.{term}"
+        )
 
     if date_from:
-        clauses.append("created_at::date >= %s")
-        params.append(date_from.strftime("%Y-%m-%d"))
+        query = query.gte("created_at", f"{date_from.strftime('%Y-%m-%d')}T00:00:00")
 
     if date_to:
-        clauses.append("created_at::date <= %s")
-        params.append(date_to.strftime("%Y-%m-%d"))
+        query = query.lte("created_at", f"{date_to.strftime('%Y-%m-%d')}T23:59:59")
 
-    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    cur.execute(
-        f"SELECT * FROM shipments{where} ORDER BY updated_at DESC", params
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [dict(r) for r in rows]
+    response = query.order("updated_at", desc=True).execute()
+    return response.data
 
 
 def get_shipment(shipment_id):
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM shipments WHERE id = %s", (shipment_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return dict(row) if row else None
+    response = (
+        supabase.table("shipments")
+        .select("*")
+        .eq("id", shipment_id)
+        .maybe_single()
+        .execute()
+    )
+    return response.data
 
 
 def get_history(shipment_id):
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        "SELECT * FROM status_history WHERE shipment_id = %s ORDER BY created_at DESC",
-        (shipment_id,),
+    response = (
+        supabase.table("status_history")
+        .select("*")
+        .eq("shipment_id", shipment_id)
+        .order("created_at", desc=True)
+        .execute()
     )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [dict(r) for r in rows]
+    return response.data
 
 
 def create_shipment(venue_id, supplier_id, address, contact_name, notes, created_by):
-    conn = get_db()
-    cur = conn.cursor()
     ts = now()
-    cur.execute(
-        """INSERT INTO shipments (venue_id, supplier_id, address, contact_name, notes, created_by, created_at, updated_at)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-        (venue_id, supplier_id, address, contact_name, notes, created_by, ts, ts),
+    response = (
+        supabase.table("shipments")
+        .insert(
+            {
+                "venue_id": venue_id,
+                "supplier_id": supplier_id,
+                "address": address,
+                "contact_name": contact_name,
+                "notes": notes,
+                "created_by": created_by,
+                "created_at": ts,
+                "updated_at": ts,
+            }
+        )
+        .execute()
     )
-    shipment_id = cur.fetchone()[0]
-    cur.execute(
-        "INSERT INTO status_history (shipment_id, new_status, changed_by, note, created_at) VALUES (%s, %s, %s, %s, %s)",
-        (shipment_id, "pending", created_by, "Shipment created", ts),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    shipment_id = response.data[0]["id"]
+
+    supabase.table("status_history").insert(
+        {
+            "shipment_id": shipment_id,
+            "new_status": "pending",
+            "changed_by": created_by,
+            "note": "Shipment created",
+            "created_at": ts,
+        }
+    ).execute()
+
     return shipment_id
 
 
 def update_shipment(shipment_id, updates, changed_by="", status_note=""):
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM shipments WHERE id = %s", (shipment_id,))
-    old = cur.fetchone()
+    old = get_shipment(shipment_id)
     if not old:
-        cur.close()
-        conn.close()
         return False
 
     old_status = old["status"]
@@ -182,43 +144,32 @@ def update_shipment(shipment_id, updates, changed_by="", status_note=""):
         "serial_number", "tracking_number", "carrier",
         "status", "notes", "assigned_to",
     ]
-    sets = []
-    vals = []
-    for field in allowed:
-        if field in updates and updates[field] is not None:
-            sets.append(f"{field} = %s")
-            vals.append(updates[field])
+    changes = {k: v for k, v in updates.items() if k in allowed and v is not None}
 
     ts = now()
-    if sets:
-        sets.append("updated_at = %s")
-        vals.append(ts)
-        vals.append(shipment_id)
-        cur.execute(
-            f"UPDATE shipments SET {', '.join(sets)} WHERE id = %s", vals
-        )
+    if changes:
+        changes["updated_at"] = ts
+        supabase.table("shipments").update(changes).eq("id", shipment_id).execute()
 
     new_status = updates.get("status")
     if new_status and new_status != old_status:
-        cur.execute(
-            "INSERT INTO status_history (shipment_id, old_status, new_status, changed_by, note, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
-            (shipment_id, old_status, new_status, changed_by, status_note, ts),
-        )
+        supabase.table("status_history").insert(
+            {
+                "shipment_id": shipment_id,
+                "old_status": old_status,
+                "new_status": new_status,
+                "changed_by": changed_by,
+                "note": status_note,
+                "created_at": ts,
+            }
+        ).execute()
 
-    conn.commit()
-    cur.close()
-    conn.close()
     return True
 
 
 def delete_shipment(shipment_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM status_history WHERE shipment_id = %s", (shipment_id,))
-    cur.execute("DELETE FROM shipments WHERE id = %s", (shipment_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    supabase.table("status_history").delete().eq("shipment_id", shipment_id).execute()
+    supabase.table("shipments").delete().eq("id", shipment_id).execute()
 
 
 # --- UI ---
