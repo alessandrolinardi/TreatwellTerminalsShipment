@@ -1,2 +1,8 @@
 streamlit>=1.30.0
 supabase>=2.0.0
+
+# Pin added 2026-08-05: starlette 1.4.0 made `thread_minimum_size` a required
+# keyword-only arg on GZipResponder.__init__, which streamlit (<=1.61.0) does not
+# pass — every HTTP request 500s in the gzip middleware. Remove once a streamlit
+# release supports starlette 1.4.
+starlette<1.4.0
